@@ -3,8 +3,10 @@
 // Data一般用于表示从服务器上请求到的数据，Info一般表示解析并筛选过的要传输给大模型的数据。变量使用驼峰命名，常量使用全大写下划线命名。
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
+import { SSEServerTransport } from '@modelcontextprotocol/sdk/server/sse.js';
 import axios from 'axios';
 import { z } from 'zod';
+import express from 'express';
 import { format } from 'date-fns';
 import { toZonedTime } from 'date-fns-tz';
 import {
@@ -1055,10 +1057,50 @@ async function getStations(): Promise<Record<string, StationData>> {
 async function init() {}
 
 async function main() {
-  const transport = new StdioServerTransport();
+  let transport: StdioServerTransport | SSEServerTransport | null = null;
+  const args = process.argv.slice(2);
+  let mode = 'stdio'; // 默认使用stdio模式
+  let port = 3000; // 默认端口3000
+
+  // 手动解析命令行参数以支持命名参数
+  for (let i = 0; i < args.length; i++) {
+    if (args[i] === '--mode' && i + 1 < args.length) {
+      mode = args[i + 1];
+      i++;
+    } else if (args[i] === '--port' && i + 1 < args.length) {
+      port = parseInt(args[i + 1], 10);
+      i++;
+    } else if (i === 0) {
+      mode = args[i]; // 支持位置参数作为mode
+    } else if (i === 1) {
+      port = parseInt(args[i], 10); // 支持位置参数作为port
+    }
+  }
+
+  if (mode === 'sse') {
+    const app = express();
+    app.get('/sse', async (req, res) => {
+      transport = new SSEServerTransport('/messages', res);
+      await server.connect(transport);
+    });
+    app.post('/messages', (req, res) => {
+      if (transport instanceof SSEServerTransport) {
+        transport.handlePostMessage(req, res);
+      } else {
+        res.status(503).send('SSE transport not initialized');
+      }
+    });
+    app.listen(port, () => {
+      console.error(`12306 MCP Server running on SSE at http://localhost:${port}/sse`);
+    });
+  } else {
+    transport = new StdioServerTransport();
+    console.error('12306 MCP Server running on stdio');
+    await init();
+    await server.connect(transport);
+  }
+
   await init();
-  await server.connect(transport);
-  console.error('12306 MCP Server running on stdio @Joooook');
 }
 
 main().catch((error) => {
