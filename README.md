@@ -46,7 +46,8 @@ npm i
 ### CLI
 ~~~bash
 npm run build
-node ./build/index.js
+node ./build/index.js  # 使用stdio模式
+node ./build/index.js --mode sse --port 4000  # 使用SSE模式并指定端口4000
 ~~~
 
 ### MCP sever configuration
