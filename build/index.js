@@ -6,11 +6,14 @@ import { SSEServerTransport } from '@modelcontextprotocol/sdk/server/sse.js';
 import axios from 'axios';
 import { z } from 'zod';
 import express from 'express';
-import { format } from 'date-fns';
+import { format, parse } from 'date-fns';
 import { toZonedTime } from 'date-fns-tz';
 import { StationDataKeys, TicketDataKeys, } from './types.js';
+const VERSION = "0.3.2";
 const API_BASE = 'https://kyfw.12306.cn';
 const WEB_URL = 'https://www.12306.cn/index/';
+const LCQUERY_INIT_URL = "https://kyfw.12306.cn/otn/lcQuery/init";
+const LCQUERY_PATH = await getLCQueryPath();
 const MISSING_STATIONS = [
     {
         station_id: '@cdd',
@@ -152,6 +155,54 @@ const TRAIN_FILTERS = {
             : false;
     },
 };
+const TIME_COMPARETOR = {
+    startTime: (ticketInfoA, ticketInfoB) => {
+        const timeA = new Date(ticketInfoA.start_date);
+        const timeB = new Date(ticketInfoB.start_date);
+        if (timeA.getTime() != timeB.getTime()) {
+            return timeA.getTime() - timeB.getTime();
+        }
+        const startTimeA = ticketInfoA.start_time.split(':');
+        const startTimeB = ticketInfoB.start_time.split(':');
+        const hourA = parseInt(startTimeA[0]);
+        const hourB = parseInt(startTimeB[0]);
+        if (hourA != hourB) {
+            return hourA - hourB;
+        }
+        const minuteA = parseInt(startTimeA[1]);
+        const minuteB = parseInt(startTimeB[1]);
+        return minuteA - minuteB;
+    },
+    arriveTime: (ticketInfoA, ticketInfoB) => {
+        const timeA = new Date(ticketInfoA.arrive_date);
+        const timeB = new Date(ticketInfoB.arrive_date);
+        if (timeA.getTime() != timeB.getTime()) {
+            return timeA.getTime() - timeB.getTime();
+        }
+        const arriveTimeA = ticketInfoA.arrive_time.split(':');
+        const arriveTimeB = ticketInfoB.arrive_time.split(':');
+        const hourA = parseInt(arriveTimeA[0]);
+        const hourB = parseInt(arriveTimeB[0]);
+        if (hourA != hourB) {
+            return hourA - hourB;
+        }
+        const minuteA = parseInt(arriveTimeA[1]);
+        const minuteB = parseInt(arriveTimeB[1]);
+        return minuteA - minuteB;
+    },
+    duration: (ticketInfoA, ticketInfoB) => {
+        const lishiTimeA = ticketInfoA.lishi.split(':');
+        const lishiTimeB = ticketInfoB.lishi.split(':');
+        const hourA = parseInt(lishiTimeA[0]);
+        const hourB = parseInt(lishiTimeB[0]);
+        if (hourA != hourB) {
+            return hourA - hourB;
+        }
+        const minuteA = parseInt(lishiTimeA[1]);
+        const minuteB = parseInt(lishiTimeB[1]);
+        return minuteA - minuteB;
+    },
+};
 function parseCookies(cookies) {
     const cookieRecord = {};
     cookies.forEach((cookie) => {
@@ -231,8 +282,18 @@ function parseTicketsInfo(ticketsData, map) {
     for (const ticket of ticketsData) {
         const prices = extractPrices(ticket.yp_info_new, ticket.seat_discount_info, ticket);
         const dw_flag = extractDWFlags(ticket.dw_flag);
+        const startHours = parseInt(ticket.start_time.split(':')[0]);
+        const startMinutes = parseInt(ticket.start_time.split(':')[1]);
+        const durationHours = parseInt(ticket.lishi.split(':')[0]);
+        const durationMinutes = parseInt(ticket.lishi.split(':')[1]);
+        const startDate = parse(ticket.start_train_date, 'yyyyMMdd', new Date());
+        startDate.setHours(startHours, startMinutes);
+        const arriveDate = startDate;
+        arriveDate.setHours(startHours + durationHours, startMinutes + durationMinutes);
         result.push({
             train_no: ticket.train_no,
+            start_date: format(startDate, "yyyy-MM-dd"),
+            arrive_date: format(arriveDate, "yyyy-MM-dd"),
             start_train_code: ticket.station_train_code,
             start_time: ticket.start_time,
             arrive_time: ticket.arrive_time,
@@ -247,6 +308,37 @@ function parseTicketsInfo(ticketsData, map) {
     }
     return result;
 }
+/**
+ * 格式化票量信息，提供语义化描述
+ * @param num 票量数字或状态字符串
+ * @returns 格式化后的票量描述
+ */
+function formatTicketStatus(num) {
+    // 检查是否为纯数字
+    if (num.match(/^\d+$/)) {
+        const count = parseInt(num);
+        if (count === 0) {
+            return '无票';
+        }
+        else {
+            return `剩余${count}张票`;
+        }
+    }
+    // 处理特殊状态字符串
+    switch (num) {
+        case '有':
+        case '充足':
+            return '有票';
+        case '无':
+        case '--':
+        case '':
+            return '无票';
+        case '候补':
+            return '无票需候补';
+        default:
+            return `${num}票`;
+    }
+}
 function formatTicketsInfo(ticketsInfo) {
     if (ticketsInfo.length === 0) {
         return '没有查询到相关车次信息';
@@ -256,34 +348,57 @@ function formatTicketsInfo(ticketsInfo) {
         let infoStr = '';
         infoStr += `${ticketInfo.start_train_code}(实际车次train_no: ${ticketInfo.train_no}) ${ticketInfo.from_station}(telecode: ${ticketInfo.from_station_telecode}) -> ${ticketInfo.to_station}(telecode: ${ticketInfo.to_station_telecode}) ${ticketInfo.start_time} -> ${ticketInfo.arrive_time} 历时：${ticketInfo.lishi}`;
         ticketInfo.prices.forEach((price) => {
-            infoStr += `\n- ${price.seat_name}: ${price.num.match(/^\d+$/) ? price.num + '张' : price.num}剩余 ${price.price}元`;
+            const ticketStatus = formatTicketStatus(price.num);
+            infoStr += `\n- ${price.seat_name}: ${ticketStatus} ${price.price}元`;
         });
         result += `${infoStr}\n`;
     });
     return result;
 }
-function filterTicketsInfo(ticketsInfo, filters) {
-    if (filters.length === 0) {
-        return ticketsInfo;
+function filterTicketsInfo(ticketsInfo, trainFilterFlags, sortFlag = '', sortReverse = false, limitedNum = 0) {
+    let result;
+    if (trainFilterFlags.length === 0) {
+        result = ticketsInfo;
     }
-    const result = [];
-    for (const ticketInfo of ticketsInfo) {
-        for (const filter of filters) {
-            if (TRAIN_FILTERS[filter](ticketInfo)) {
-                result.push(ticketInfo);
-                break;
+    else {
+        result = [];
+        for (const ticketInfo of ticketsInfo) {
+            for (const filter of trainFilterFlags) {
+                if (TRAIN_FILTERS[filter](ticketInfo)) {
+                    result.push(ticketInfo);
+                    break;
+                }
             }
         }
     }
-    return result;
+    if (Object.keys(TIME_COMPARETOR).includes(sortFlag)) {
+        result.sort(TIME_COMPARETOR[sortFlag]);
+        if (sortReverse) {
+            result.reverse();
+        }
+    }
+    if (limitedNum == 0) {
+        return result;
+    }
+    return result.slice(0, limitedNum);
 }
 function parseInterlinesTicketInfo(interlineTicketsData) {
     const result = [];
     for (const interlineTicketData of interlineTicketsData) {
         const prices = extractPrices(interlineTicketData.yp_info, interlineTicketData.seat_discount_info, interlineTicketData);
+        const startHours = parseInt(interlineTicketData.start_time.split(':')[0]);
+        const startMinutes = parseInt(interlineTicketData.start_time.split(':')[1]);
+        const durationHours = parseInt(interlineTicketData.lishi.split(':')[0]);
+        const durationMinutes = parseInt(interlineTicketData.lishi.split(':')[1]);
+        const startDate = parse(interlineTicketData.start_train_date, 'yyyyMMdd', new Date());
+        startDate.setHours(startHours, startMinutes);
+        const arriveDate = startDate;
+        arriveDate.setHours(startHours + durationHours, startMinutes + durationMinutes);
         result.push({
             train_no: interlineTicketData.train_no,
             start_train_code: interlineTicketData.station_train_code,
+            start_date: format(startDate, "yyyy-MM-dd"),
+            arrive_date: format(arriveDate, "yyyy-MM-dd"),
             start_time: interlineTicketData.start_time,
             arrive_time: interlineTicketData.arrive_time,
             lishi: interlineTicketData.lishi,
@@ -301,8 +416,9 @@ function parseInterlinesInfo(interlineData) {
     const result = [];
     for (const ticket of interlineData) {
         const interlineTickets = parseInterlinesTicketInfo(ticket.fullList);
+        const lishi = extractLishi(ticket.all_lishi);
         result.push({
-            all_lishi: ticket.all_lishi,
+            lishi: lishi,
             start_time: ticket.start_time,
             start_date: ticket.train_date,
             middle_date: ticket.middle_date,
@@ -335,7 +451,7 @@ function formatInterlinesInfo(interlinesInfo) {
             ? '同车换乘'
             : interlineInfo.same_station
                 ? '同站换乘'
-                : '换站换乘'} | ${interlineInfo.wait_time} | ${interlineInfo.all_lishi}\n\n`;
+                : '换站换乘'} | ${interlineInfo.wait_time} | ${interlineInfo.lishi}\n\n`;
         result +=
             '\t' + formatTicketsInfo(interlineInfo.ticketList).replace(/\n/g, '\n\t');
         result += '\n';
@@ -360,6 +476,21 @@ function parseStationsData(rawData) {
         result[station.station_code] = station;
     }
     return result;
+}
+/**
+ * 格式化历时数据为hh:mm，为比较历时做准备。
+ * @param all_lishi interlineTicket中的历时数据， 形如：H小时M分钟或M分钟
+ * @returns 和普通余票数据中的lishi字段一样的hh:mm格式的历时
+ */
+function extractLishi(all_lishi) {
+    const match = all_lishi.match(/(?:(\d+)小时)?(\d+?)分钟/);
+    if (!match) {
+        throw new Error('extractLishi失败，没有匹配到关键词');
+    }
+    if (!match[1]) {
+        return `00:${match[2]}`;
+    }
+    return `${match[1].padStart(2, '0')}:${match[2]}}`;
 }
 function extractPrices(yp_info, seat_discount_info, ticketData) {
     const PRICE_STR_LENGTH = 10;
@@ -447,7 +578,7 @@ async function make12306Request(url, scheme = new URLSearchParams(), headers = {
 // Create server instance
 const server = new McpServer({
     name: '12306-mcp',
-    version: '0.3.1',
+    version: VERSION,
     capabilities: {
         resources: {},
         tools: {},
@@ -479,7 +610,7 @@ server.tool('get-current-date', '获取当前日期，以上海时区（Asia/Sha
         };
     }
 });
-server.tool('get-stations-code-in-city', '通过中文城市名查询该城市 **所有** 火车站的名称及其对应的 `station_code`，结果是一个包含多个车站信息的列表。当用户想了解一个城市有哪些火车站，或者不确定具体从哪个车站出发/到达时可以使用此接口。', {
+server.tool('get-stations-code-in-city', '通过中文城市名查询该城市 **所有** 火车站的名称及其对应的 `station_code`，结果是一个包含多个车站信息的列表。', {
     city: z.string().describe('中文城市名称，例如："北京", "上海"'),
 }, async ({ city }) => {
     if (!(city in CITY_STATIONS)) {
@@ -553,18 +684,34 @@ server.tool('get-tickets', '查询12306余票信息。', {
         .describe('查询日期，格式为 "yyyy-MM-dd"。如果用户提供的是相对日期（如“明天”），请务必先调用 `get-current-date` 接口获取当前日期，并计算出目标日期。'),
     fromStation: z
         .string()
-        .describe('出发地的 `station_code` 。必须是通过 `get-station-code-by-name` 或 `get-station-code-of-city` 接口查询得到的编码，严禁直接使用中文地名。'),
+        .describe('出发地的 `station_code` 。必须是通过 `get-station-code-by-names` 或 `get-station-code-of-citys` 接口查询得到的编码，严禁直接使用中文地名。'),
     toStation: z
         .string()
-        .describe('到达地的 `station_code` 。必须是通过 `get-station-code-by-name` 或 `get-station-code-of-city` 接口查询得到的编码，严禁直接使用中文地名。'),
+        .describe('到达地的 `station_code` 。必须是通过 `get-station-code-by-names` 或 `get-station-code-of-citys` 接口查询得到的编码，严禁直接使用中文地名。'),
     trainFilterFlags: z
         .string()
         .regex(/^[GDZTKOFS]*$/)
         .max(8)
         .optional()
         .default('')
-        .describe('车次筛选条件，默认为空，即不筛选。例如用户说“高铁票”，则应使用 "G"。可选标志：[G(高铁/城际),D(动车),Z(直达特快),T(特快),K(快速),O(其他),F(复兴号),S(智能动车组)]'),
-}, async ({ date, fromStation, toStation, trainFilterFlags }) => {
+        .describe('车次筛选条件，默认为空，即不筛选。支持多个标志同时筛选。例如用户说“高铁票”，则应使用 "G"。可选标志：[G(高铁/城际),D(动车),Z(直达特快),T(特快),K(快速),O(其他),F(复兴号),S(智能动车组)]'),
+    sortFlag: z
+        .string()
+        .optional()
+        .default('')
+        .describe('排序方式，默认为空，即不排序。仅支持单一标识。可选标志：[startTime(出发时间从早到晚), arriveTime(抵达时间从早到晚), duration(历时从短到长)]'),
+    sortReverse: z
+        .boolean()
+        .optional()
+        .default(false)
+        .describe('是否逆向排序结果，默认为false。仅在设置了sortFlag时生效。'),
+    limitedNum: z
+        .number()
+        .min(0)
+        .optional()
+        .default(0)
+        .describe('返回的余票数量限制，默认为0，即不限制。'),
+}, async ({ date, fromStation, toStation, trainFilterFlags, sortFlag, sortReverse, limitedNum }) => {
     // 检查日期是否早于当前日期
     if (!checkDate(date)) {
         return {
@@ -617,7 +764,7 @@ server.tool('get-tickets', '查询12306余票信息。', {
             content: [{ type: 'text', text: 'Error: parse tickets info failed. ' }],
         };
     }
-    const filteredTicketsInfo = filterTicketsInfo(ticketsInfo, trainFilterFlags);
+    const filteredTicketsInfo = filterTicketsInfo(ticketsInfo, trainFilterFlags, sortFlag, sortReverse, limitedNum);
     return {
         content: [{ type: 'text', text: formatTicketsInfo(filteredTicketsInfo) }],
     };
@@ -639,15 +786,15 @@ server.tool('get-interline-tickets', '查询12306中转余票信息。尚且只�
         .describe('查询日期，格式为 "yyyy-MM-dd"。如果用户提供的是相对日期（如“明天”），请务必先调用 `get-current-date` 接口获取当前日期，并计算出目标日期。'),
     fromStation: z
         .string()
-        .describe('出发地的 `station_code` 。必须是通过 `get-station-code-by-name` 或 `get-station-code-of-city` 接口查询得到的编码，严禁直接使用中文地名。'),
+        .describe('出发地的 `station_code` 。必须是通过 `get-station-code-by-names` 或 `get-station-code-of-citys` 接口查询得到的编码，严禁直接使用中文地名。'),
     toStation: z
         .string()
-        .describe('出发地的 `station_code` 。必须是通过 `get-station-code-by-name` 或 `get-station-code-of-city` 接口查询得到的编码，严禁直接使用中文地名。'),
+        .describe('出发地的 `station_code` 。必须是通过 `get-station-code-by-names` 或 `get-station-code-of-citys` 接口查询得到的编码，严禁直接使用中文地名。'),
     middleStation: z
         .string()
         .optional()
         .default('')
-        .describe('中转地的 `station_code` ，可选。必须是通过 `get-station-code-by-name` 或 `get-station-code-of-city` 接口查询得到的编码，严禁直接使用中文地名。'),
+        .describe('中转地的 `station_code` ，可选。必须是通过 `get-station-code-by-names` 或 `get-station-code-of-citys` 接口查询得到的编码，严禁直接使用中文地名。'),
     showWZ: z
         .boolean()
         .optional()
@@ -660,7 +807,23 @@ server.tool('get-interline-tickets', '查询12306中转余票信息。尚且只�
         .optional()
         .default('')
         .describe('车次筛选条件，默认为空。从以下标志中选取多个条件组合[G(高铁/城际),D(动车),Z(直达特快),T(特快),K(快速),O(其他),F(复兴号),S(智能动车组)]'),
-}, async ({ date, fromStation, toStation, middleStation, showWZ, trainFilterFlags, }) => {
+    sortFlag: z
+        .string()
+        .optional()
+        .default('')
+        .describe('排序方式，默认为空，即不排序。仅支持单一标识。可选标志：[startTime(出发时间从早到晚), arriveTime(抵达时间从早到晚), duration(历时从短到长)]'),
+    sortReverse: z
+        .boolean()
+        .optional()
+        .default(false)
+        .describe('是否逆向排序结果，默认为false。仅在设置了sortFlag时生效。'),
+    limitedNum: z
+        .number()
+        .min(0)
+        .optional()
+        .default(0)
+        .describe('返回的余票数量限制，默认为0，即不限制。'),
+}, async ({ date, fromStation, toStation, middleStation, showWZ, trainFilterFlags, sortFlag, sortReverse, limitedNum }) => {
     // 检查日期是否早于当前日期
     if (!checkDate(date)) {
         return {
@@ -678,7 +841,7 @@ server.tool('get-interline-tickets', '查询12306中转余票信息。尚且只�
             content: [{ type: 'text', text: 'Error: Station not found. ' }],
         };
     }
-    const queryUrl = `${API_BASE}/lcquery/queryG`;
+    const queryUrl = `${API_BASE}${LCQUERY_PATH}`;
     const queryParams = new URLSearchParams({
         train_date: date,
         from_station_telecode: fromStation,
@@ -716,7 +879,7 @@ server.tool('get-interline-tickets', '查询12306中转余票信息。尚且只�
     // 请求成功，但查询有误
     if (typeof queryResponse.data == 'string') {
         return {
-            content: [{ type: 'text', text: queryResponse.errorMsg }],
+            content: [{ type: 'text', text: `很抱歉，未查到相关的列车余票。(${queryResponse.errorMsg})` }],
         };
     }
     // 请求和查询都没问题
@@ -731,7 +894,7 @@ server.tool('get-interline-tickets', '查询12306中转余票信息。尚且只�
             ],
         };
     }
-    const filteredInterlineTicketsInfo = filterTicketsInfo(interlineTicketsInfo, trainFilterFlags);
+    const filteredInterlineTicketsInfo = filterTicketsInfo(interlineTicketsInfo, trainFilterFlags, sortFlag, sortReverse, limitedNum);
     return {
         content: [
             {
@@ -747,10 +910,10 @@ server.tool('get-train-route-stations', '查询特定列车车次在指定区间
         .describe('要查询的实际车次编号 `train_no`，例如 "240000G10336"，而非"G1033"。此编号通常可以从 `get-tickets` 的查询结果中获取，或者由用户直接提供。'),
     fromStationTelecode: z
         .string()
-        .describe('该列车行程的**出发站**的 `station_telecode` (3位字母编码`)。通常来自 `get-tickets` 结果中的 `telecode` 字段，或者通过 `get-station-code-by-name` 得到。'),
+        .describe('该列车行程的**出发站**的 `station_telecode` (3位字母编码`)。通常来自 `get-tickets` 结果中的 `telecode` 字段，或者通过 `get-station-code-by-names` 得到。'),
     toStationTelecode: z
         .string()
-        .describe('该列车行程的**到达站**的 `station_telecode` (3位字母编码)。通常来自 `get-tickets` 结果中的 `telecode` 字段，或者通过 `get-station-code-by-name` 得到。'),
+        .describe('该列车行程的**到达站**的 `station_telecode` (3位字母编码)。通常来自 `get-tickets` 结果中的 `telecode` 字段，或者通过 `get-station-code-by-names` 得到。'),
     departDate: z
         .string()
         .length(10)
@@ -792,7 +955,7 @@ async function getStations() {
     if (html == null) {
         throw new Error('Error: get 12306 web page failed.');
     }
-    const match = html.match('.(/script/core/common/station_name.+?.js)');
+    const match = html.match('.(/script/core/common/station_name.+?\.js)');
     if (match == null) {
         throw new Error('Error: get station name js file failed.');
     }
@@ -810,6 +973,17 @@ async function getStations() {
         }
     }
     return stationsData;
+}
+async function getLCQueryPath() {
+    const html = await make12306Request(LCQUERY_INIT_URL);
+    if (html == null) {
+        throw new Error('Error: get 12306 web page failed.');
+    }
+    const match = html.match(/ var lc_search_url = '(.+?)'/);
+    if (match == null) {
+        throw new Error('Error: get station name js file failed.');
+    }
+    return match[1];
 }
 async function init() { }
 async function main() {
